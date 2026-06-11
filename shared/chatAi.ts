@@ -25,6 +25,14 @@ export const parametricArtifactSchema = z.object({
 export const parametricCompileOutputSchema = z.object({
   status: z.literal('success'),
   message: z.string(),
+  inspection: z
+    .object({
+      views: z.array(
+        z.enum(['ISO', 'FRONT', 'BACK', 'LEFT', 'RIGHT', 'TOP', 'BOTTOM']),
+      ),
+      imageAttached: z.boolean(),
+    })
+    .optional(),
 });
 
 export const answerUserSchema = z.object({
@@ -34,13 +42,13 @@ export const answerUserSchema = z.object({
 export const chatTools = {
   build_parametric_model: tool({
     description:
-      'Create or update the complete OpenSCAD CAD artifact for the user.',
+      'Create or update the complete OpenSCAD CAD artifact. After the browser compiles it, inspect the returned multi-view preview sheet and call this tool again if the model needs another revision.',
     inputSchema: parametricArtifactSchema,
     outputSchema: parametricCompileOutputSchema,
   }),
   answer_user: tool({
     description:
-      'Reply normally when the user is not asking to create, update, or fix a CAD model.',
+      'Send the final user-facing chat message. Use this for normal non-CAD replies, and after a CAD build when the multi-view preview satisfies the user request.',
     inputSchema: answerUserSchema,
     outputSchema: answerUserSchema,
   }),

@@ -2,7 +2,7 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import { chatTools, type AppUIMessage, type AppTools } from '@shared/chatAi';
-import { getParametricText } from '@shared/parametricParts';
+import { cleanAssistantText, getParametricText } from '@shared/parametricParts';
 import { imageIdFromFilename, imageStoragePath } from '@shared/imageRefs';
 import { normalizeConversationSuggestions } from '@shared/suggestions';
 import type { Conversation, Message, MeshFileType, Model } from '@shared/types';
@@ -27,6 +27,12 @@ import { billing, BillingClientError } from './billingClient';
 import { corsHeaders, isRecord } from './api';
 import { env, requiredEnv } from './env';
 import { logError } from './serverLog';
+import {
+  decidePersistAction,
+  hasPendingClientToolCall,
+  isDanglingToolPart,
+  resolveDanglingToolParts,
+} from './chatToolPersistence';
 import { handleMeshRequest } from './mesh';
 import { getAnonSupabaseClient } from './supabaseClient';
 
@@ -46,7 +52,7 @@ const MODEL_PRICES: Record<
   { input: number; output: number; cacheRead?: number; cacheWrite?: number }
 > = {
   // Anthropic
-  'anthropic/claude-opus-4.8': { input: 5, output: 25 },
+  'anthropic/claude-fable-5': { input: 10, output: 50 },
   'anthropic/claude-opus-4': { input: 15, output: 75 },
   'anthropic/claude-sonnet-4.6': { input: 3, output: 15 },
   'anthropic/claude-sonnet-4.5': { input: 3, output: 15 },
@@ -81,11 +87,9 @@ const FALLBACK_MODEL_PRICE = { input: 15, output: 75 };
  */
 const USD_PER_BILLING_TOKEN = 0.01;
 
-const PARAMETRIC_AGENT_PROMPT = `You are Adam, an AI CAD editor that creates and modifies OpenSCAD models. The user can see a live preview of the model on the right while you work.
+const PARAMETRIC_AGENT_PROMPT = `You are Adam, an agentic AI CAD editor that creates and modifies OpenSCAD models. The user can see a live preview of the model on the right while you work.
 
-On each user turn, choose exactly one path:
-- Use build_parametric_model whenever the user asks for a CAD model, an edit to a CAD model, or a fix for OpenSCAD code. Speak back briefly (one or two sentences) and let the tool carry the change — never paste OpenSCAD into your reply text.
-- Use answer_user only for greetings, thanks, app/capability questions, or informational questions that do not ask you to create or change a model.
+Use build_parametric_model whenever the user asks for a CAD model, an edit to a CAD model, or a fix for OpenSCAD code. The tool input is the model shown to the user, so do not paste OpenSCAD into normal reply text. Use answer_user for final user-facing text and for normal non-CAD replies.
 
 Never say you created, designed, generated, updated, or fixed a model unless you used build_parametric_model in that turn.
 
@@ -97,8 +101,40 @@ The build_parametric_model tool input is the artifact shown to the user:
 - code: complete raw OpenSCAD code, no markdown, no code fences
 
 After you call build_parametric_model, the browser compiles the OpenSCAD and
-returns whether compilation succeeded. If it fails, fix the code with another
-build_parametric_model call.
+returns a multi-view preview sheet covering isometric, front, back, left,
+right, top, and bottom views. Inspect every view against the user's request. If
+the code fails to compile, or any view shows missing, wrong, disconnected,
+non-printable, too-simple, hidden, or visually unclear geometry, call
+build_parametric_model again with a corrected complete script. Keep looping
+through write → multi-view screenshot inspection → rewrite until the model is
+good or you hit the turn limit. Do not stop after the first successful compile
+unless the preview sheet shows that the model satisfies the request from every
+view. When all views satisfy the request, call answer_user with the concise
+final response.
+
+Iteration rule:
+- After every build_parametric_model call, silently inspect the returned views
+  before speaking to the user.
+- If any view shows missing, wrong, disconnected, non-printable, too-simple,
+  hidden, or visually unclear geometry, call build_parametric_model again with
+  a corrected complete OpenSCAD script.
+- If the views show the model satisfies the user's request from every required
+  angle, call answer_user with the final text.
+- Do not finalize just because OpenSCAD compiled. Finalize only because the
+  views look right.
+
+Multi-feature checklist before stopping:
+- Phone case → hollow phone pocket, wrap-over lip, camera cutout, charging-port
+  opening, side button cutouts, printable wall thickness, all cuts visible.
+- Mug → body, hollow interior, rim, base, handle, printable wall thickness.
+- Vehicle / character / prop → recognizable silhouette, main appendages or
+  components, surface details, colors, no disconnected floating parts.
+
+answer_user.message must be only the short user-facing message. Do not include
+analysis, draft notes, screenshot observations, storage URLs, filenames,
+attachment labels, or phrases like "preview sheet attached automatically".
+After a successful build, speak in past tense (for example, "Done — I made...")
+instead of future tense ("I'll make...").
 
 # OpenSCAD code rules
 
@@ -266,6 +302,7 @@ function jsonResponse(body: unknown, status: number) {
 }
 
 const THINKING_BUDGET_TOKENS = 9000;
+const PARAMETRIC_MAX_OUTPUT_TOKENS = 64000;
 
 type ChatProvider = 'anthropic' | 'google' | 'openrouter';
 
@@ -325,22 +362,45 @@ function buildChatModel(
   modelId: string,
   providers: ChatProviders,
   thinking: boolean,
+  thinkingBudget: number = THINKING_BUDGET_TOKENS,
 ): { model: LanguageModel; providerOptions?: ProviderOptions } {
   const provider = providerFor(modelId);
+  const hasCappedThinkingBudget =
+    thinking && thinkingBudget !== THINKING_BUDGET_TOKENS;
+
+  if (provider === 'openrouter') {
+    return {
+      model: providers.openrouter().chat(modelId, {
+        ...(thinking ? { reasoning: { max_tokens: thinkingBudget } } : {}),
+        usage: { include: true },
+      }),
+    };
+  }
 
   if (provider === 'anthropic') {
     // Anthropic's API uses dashes everywhere ("claude-haiku-4-5"), while the
     // OpenRouter alias uses dots ("claude-haiku-4.5"). Normalize both.
     const id = modelId.slice('anthropic/'.length).replace(/\./g, '-');
+    const adaptiveThinking = usesAdaptiveAnthropicThinking(id);
     return {
       model: providers.anthropic()(id),
       providerOptions: thinking
         ? {
             anthropic: {
-              thinking: {
-                type: 'enabled',
-                budgetTokens: THINKING_BUDGET_TOKENS,
-              },
+              ...(adaptiveThinking
+                ? {
+                    thinking: {
+                      type: 'adaptive' as const,
+                      display: 'summarized' as const,
+                    },
+                    effort: hasCappedThinkingBudget ? 'low' : 'high',
+                  }
+                : {
+                    thinking: {
+                      type: 'enabled' as const,
+                      budgetTokens: thinkingBudget,
+                    },
+                  }),
             },
           }
         : undefined,
@@ -351,32 +411,56 @@ function buildChatModel(
     const id = modelId.slice('google/'.length);
     return {
       model: providers.google()(id),
-      // Gemini 3 Pro (and most current Google reasoning models) always
-      // think internally — `thinkingBudget` only controls how MUCH, not
-      // whether. `includeThoughts` is what actually surfaces those
-      // thoughts in the stream as `reasoning-delta` parts. So we always
-      // ask for thoughts; the user's "thinking" toggle just bumps the
-      // budget. Without this, Google streams look as if the model isn't
-      // reasoning at all even though it is.
       providerOptions: {
         google: {
           thinkingConfig: {
             includeThoughts: true,
-            ...(thinking ? { thinkingBudget: THINKING_BUDGET_TOKENS } : {}),
           },
         },
       },
     };
   }
 
-  return {
-    model: providers.openrouter().chat(modelId, {
-      ...(thinking
-        ? { reasoning: { max_tokens: THINKING_BUDGET_TOKENS } }
-        : {}),
-      usage: { include: true },
-    }),
-  };
+  throw new Error(`Unsupported chat model ${modelId}`);
+}
+
+// Capability gates below accept either the OpenRouter alias (`anthropic/claude-…`)
+// or the bare Anthropic ID — strip the prefix here so every gate is called the
+// same way regardless of which form the caller has on hand.
+function bareModelId(modelId: string): string {
+  const id = modelId.startsWith('anthropic/')
+    ? modelId.slice('anthropic/'.length)
+    : modelId;
+  // Anthropic's API uses dashes ("claude-opus-4-6"); the OpenRouter alias
+  // uses dots ("claude-opus-4.6"). Normalize so the version regexes match
+  // either form.
+  return id.replace(/\./g, '-');
+}
+
+// The Claude 5 generation swaps the opus/sonnet/haiku tiers for code names
+// ("claude-fable-5", "claude-mythos-5", …). Match the `claude-<codename>-5`
+// shape rather than enumerating code names so future Claude 5 variants
+// inherit the same capability gates without a list update. Versioned 4.x ids
+// ("claude-opus-4-5", "claude-haiku-4-5") don't match: their tier name is
+// followed by "-4", not "-5".
+function isClaude5Model(modelId: string): boolean {
+  return /^claude-[a-z]+-5\b/.test(bareModelId(modelId));
+}
+
+function usesAdaptiveAnthropicThinking(modelId: string) {
+  // The Claude 5 generation uses adaptive thinking, as do Claude Opus/Sonnet
+  // 4.6+. Older 4.x models take the fixed-budget path.
+  if (isClaude5Model(modelId)) return true;
+  const match = /^claude-(?:opus|sonnet)-4-(\d+)/.exec(bareModelId(modelId));
+  return match ? Number(match[1]) >= 6 : false;
+}
+
+// Whether a model accepts a forced `tool_choice` (type: "tool" / "any").
+// The Claude 5 generation rejects forced tool use with "tool_choice forces
+// tool use is not compatible with this model" — for those we must fall back
+// to auto tool choice and steer via the system prompt.
+function supportsForcedToolChoice(modelId: string): boolean {
+  return !isClaude5Model(modelId);
 }
 
 function priceFor(modelId: string) {
@@ -460,13 +544,66 @@ function finalizeStreamingParts(
       (part.type === 'reasoning' || part.type === 'text') &&
       part.state === 'streaming'
     ) {
-      return { ...part, state: 'done' as const };
+      return {
+        ...part,
+        state: 'done' as const,
+        ...(part.type === 'text'
+          ? { text: cleanAssistantText(part.text) }
+          : {}),
+      };
+    }
+    if (part.type === 'text') {
+      return { ...part, text: cleanAssistantText(part.text) };
     }
     return part;
   });
 }
 
-function messageRowToUIMessage(row: BranchMessageRow): AppUIMessage {
+function dropTextFromParametricBuildMessage(
+  parts: AppUIMessage['parts'],
+): AppUIMessage['parts'] {
+  const hasBuild = parts.some(
+    (part) => part.type === 'tool-build_parametric_model',
+  );
+  if (!hasBuild) return parts;
+
+  return parts.filter((part) => part.type !== 'text') as AppUIMessage['parts'];
+}
+
+function messageRowToUIMessage(
+  row: BranchMessageRow,
+  conversationId: string,
+): AppUIMessage {
+  const rawParts = Array.isArray(row.parts)
+    ? (row.parts as AppUIMessage['parts'])
+    : [];
+
+  const dangling = rawParts.filter(isDanglingToolPart);
+  if (dangling.length > 0) {
+    logError(
+      new Error(
+        `Resolved ${dangling.length} dangling tool call(s) in persisted branch. ` +
+          'Expected to be rare (genuine interruptions only) now that the onFinish ' +
+          'clobber guard holds — investigate the write path if this is frequent.',
+      ),
+      {
+        functionName: 'ai-chat',
+        statusCode: 200,
+        conversationId,
+        additionalContext: {
+          operation: 'resolve_dangling_tool_parts',
+          messageId: row.id,
+          role: row.role,
+          tools: dangling.map((part) => ({
+            type: part.type,
+            toolCallId: 'toolCallId' in part ? part.toolCallId : undefined,
+            state: 'state' in part ? part.state : undefined,
+          })),
+        },
+      },
+    );
+  }
+
   return {
     id: row.id,
     role: row.role,
@@ -474,7 +611,7 @@ function messageRowToUIMessage(row: BranchMessageRow): AppUIMessage {
       row.metadata && typeof row.metadata === 'object'
         ? (row.metadata as AppUIMessage['metadata'])
         : ({} as AppUIMessage['metadata']),
-    parts: Array.isArray(row.parts) ? (row.parts as AppUIMessage['parts']) : [],
+    parts: resolveDanglingToolParts(rawParts),
   };
 }
 
@@ -538,7 +675,7 @@ async function loadBranchFromDb({
   }
 
   return {
-    branch: path.map(messageRowToUIMessage),
+    branch: path.map((row) => messageRowToUIMessage(row, conversationId)),
     leafRole: path[path.length - 1].role,
   };
 }
@@ -741,22 +878,26 @@ function parametricTools({
         toolCallId: string;
         output: AppTools['build_parametric_model']['output'];
       }) {
-        // The client uploads a render of the compiled SCAD to a path
+        // The client uploads a multi-view render of the compiled SCAD to a path
         // derived from toolCallId BEFORE sending the tool result (see
         // ChatSession's `onToolCall`). If for any reason the upload
         // didn't land, `downloadAsBase64` returns null and we fall back
-        // to text-only — never block the loop on a missing thumbnail.
+        // to text-only — never block the loop on a missing inspection sheet.
         const downloaded = await downloadAsBase64(
           supabaseClient,
           'images',
           previewPathForToolCall(toolCallId),
         );
+        const views =
+          output.inspection?.views.join(', ') ??
+          'ISO, FRONT, BACK, LEFT, RIGHT, TOP, BOTTOM';
+        const text = `${output.message}\nRendered inspection views: ${views}.\nMulti-view inspection image attached: ${downloaded ? 'yes' : 'no'}.`;
 
         if (downloaded) {
           return {
             type: 'content' as const,
             value: [
-              { type: 'text' as const, text: output.message },
+              { type: 'text' as const, text },
               {
                 type: 'image-data' as const,
                 data: downloaded.base64,
@@ -766,13 +907,10 @@ function parametricTools({
           };
         }
 
-        return { type: 'text' as const, value: output.message };
+        return { type: 'text' as const, value: text };
       },
     },
-    answer_user: {
-      ...chatTools.answer_user,
-      execute: async (input: AppTools['answer_user']['input']) => input,
-    },
+    answer_user: chatTools.answer_user,
   };
 }
 
@@ -870,7 +1008,7 @@ export async function handleAiChatRequest(req: Request) {
       : parametricTools({
           supabaseClient,
           previewPathForToolCall: (toolCallId) =>
-            `${user.id}/${conversation.id}/preview-${toolCallId}`,
+            `${user.id}/${conversation.id}/inspection-preview-${toolCallId}`,
         });
 
   let branchMessages: AppUIMessage[];
@@ -999,15 +1137,30 @@ export async function handleAiChatRequest(req: Request) {
   // not the one the user requested.
   const actualModelId = chatModel(conversation, rawBody.model);
   const resolvedProvider = providerFor(actualModelId);
+  const baseLogContext = {
+    userId: user.id,
+    conversationId: conversation.id,
+    modelId: actualModelId,
+    requestedModelId: rawBody.model,
+    provider: resolvedProvider,
+  };
+
+  // Adaptive-thinking Anthropic models (Claude 5 — Fable/Mythos — and
+  // Opus/Sonnet 4.6+) get thinking enabled unconditionally: adaptive thinking
+  // lets the model decide when and how much to think, and on Fable 5 omitting
+  // it disables thinking entirely — no reasoning ever streams, and complex
+  // parametric turns degrade (especially combined with the auto tool-choice
+  // fallback). The client never sends `thinking: true` today, so without this
+  // the Anthropic thinking branch is dead code.
+  const thinkingEnabled =
+    (rawBody.thinking ?? false) ||
+    (resolvedProvider === 'anthropic' &&
+      usesAdaptiveAnthropicThinking(actualModelId));
 
   let chatLanguageModel: LanguageModel;
   let chatProviderOptions: ProviderOptions | undefined;
   try {
-    const built = buildChatModel(
-      actualModelId,
-      providers,
-      rawBody.thinking ?? false,
-    );
+    const built = buildChatModel(actualModelId, providers, thinkingEnabled);
     chatLanguageModel = built.model;
     chatProviderOptions = built.providerOptions;
   } catch (error) {
@@ -1017,9 +1170,8 @@ export async function handleAiChatRequest(req: Request) {
       userId: user.id,
       conversationId: conversation.id,
       additionalContext: {
+        ...baseLogContext,
         operation: 'build_chat_model',
-        modelId: actualModelId,
-        provider: resolvedProvider,
       },
     });
     return jsonResponse(
@@ -1028,17 +1180,20 @@ export async function handleAiChatRequest(req: Request) {
     );
   }
 
-  // Common context attached to every error we log out of this request —
-  // makes it trivial to tell "Anthropic rejected the model ID" apart from
-  // "Google rate-limited us" apart from "OpenRouter returned 502" in logs.
   const logContext = {
-    userId: user.id,
-    conversationId: conversation.id,
-    modelId: actualModelId,
-    requestedModelId: rawBody.model,
-    provider: resolvedProvider,
-    thinking: rawBody.thinking ?? false,
+    ...baseLogContext,
+    thinking: thinkingEnabled,
   };
+
+  // Parametric step 0 normally pins `build_parametric_model` via a forced
+  // tool_choice. Models that reject forced tool use (Claude 5 — Fable/Mythos)
+  // fall back to auto tool choice, where the model *might* answer with text
+  // instead of building. Track that fallback so we can detect — and log — a
+  // turn that finished without ever calling the build tool.
+  const usingAutoToolChoiceFallback =
+    conversation.type === 'parametric' &&
+    leafRole === 'user' &&
+    !supportsForcedToolChoice(actualModelId);
 
   const result = streamText({
     model: chatLanguageModel,
@@ -1046,18 +1201,42 @@ export async function handleAiChatRequest(req: Request) {
     system: systemPrompt(conversation),
     messages: modelMessages,
     tools,
-    prepareStep: ({ stepNumber }) =>
-      conversation.type === 'parametric' &&
-      leafRole === 'user' &&
-      stepNumber === 0
-        ? {
-            // Parametric user turns must take one structured path first:
-            // either create/update CAD or explicitly answer normally.
-            toolChoice: 'required',
-          }
-        : {},
-    stopWhen: stepCountIs(5),
-    maxOutputTokens: rawBody.thinking ? 20000 : 16000,
+    prepareStep: ({ stepNumber }) => {
+      if (
+        conversation.type === 'parametric' &&
+        leafRole === 'user' &&
+        stepNumber === 0
+      ) {
+        // Restrict the toolset to the build tool on the first step. Models
+        // that accept a forced tool_choice get it pinned; models that reject
+        // forced tool use (Claude 5 — Fable/Mythos) fall back to auto and rely
+        // on the system prompt to call build_parametric_model.
+        return {
+          activeTools: ['build_parametric_model' as never],
+          ...(supportsForcedToolChoice(actualModelId)
+            ? {
+                toolChoice: {
+                  type: 'tool' as const,
+                  toolName: 'build_parametric_model' as never,
+                },
+              }
+            : {}),
+        };
+      }
+      return {};
+    },
+    stopWhen: stepCountIs(conversation.type === 'parametric' ? 60 : 5),
+    // Thinking and visible response tokens share this pool. With adaptive
+    // thinking now always-on for Claude 5 / 4.6+, a heavy reasoning turn can
+    // spend 10k+ tokens before the answer starts — 32k keeps the visible
+    // response from getting squeezed. We stream, so SDK HTTP timeouts aren't
+    // a concern at this size.
+    maxOutputTokens:
+      conversation.type === 'parametric'
+        ? PARAMETRIC_MAX_OUTPUT_TOKENS
+        : thinkingEnabled
+          ? 32000
+          : 16000,
     abortSignal: req.signal,
     // Decouple our render cadence from the provider's native chunking.
     // OpenRouter (and the underlying provider) sometimes emits text in
@@ -1082,6 +1261,36 @@ export async function handleAiChatRequest(req: Request) {
         },
       });
     },
+    // Observability for the auto-tool-choice fallback (Claude 5 / Fable /
+    // Mythos): without a forced tool_choice the model can finish a parametric
+    // turn as plain text, leaving the user with no built model and no error.
+    // Surface that degraded outcome so it's measurable instead of silent.
+    onFinish: ({ steps }) => {
+      if (!usingAutoToolChoiceFallback) return;
+      const calledBuildTool = steps.some((step) =>
+        step.toolCalls?.some(
+          (call) => call.toolName === 'build_parametric_model',
+        ),
+      );
+      if (!calledBuildTool) {
+        logError(
+          new Error(
+            'Parametric turn finished without calling build_parametric_model under auto tool-choice fallback',
+          ),
+          {
+            functionName: 'ai-chat',
+            statusCode: 500,
+            userId: logContext.userId,
+            conversationId: logContext.conversationId,
+            additionalContext: {
+              ...logContext,
+              operation: 'forced_tool_choice_fallback',
+              modelId: actualModelId,
+            },
+          },
+        );
+      }
+    },
   });
 
   // Stream construction follows the onshape-extension pattern:
@@ -1101,10 +1310,10 @@ export async function handleAiChatRequest(req: Request) {
       logError(error, {
         functionName: 'ai-chat',
         statusCode: 500,
-        userId: logContext.userId,
-        conversationId: logContext.conversationId,
+        userId: baseLogContext.userId,
+        conversationId: baseLogContext.conversationId,
         additionalContext: {
-          ...logContext,
+          ...baseLogContext,
           operation: 'ui_message_stream',
         },
       });
@@ -1161,43 +1370,77 @@ export async function handleAiChatRequest(req: Request) {
               });
             }
 
-            const finalizedParts = finalizeStreamingParts(
-              responseMessage.parts,
-            );
+            const finalizedParts =
+              conversation.type === 'parametric'
+                ? dropTextFromParametricBuildMessage(
+                    finalizeStreamingParts(responseMessage.parts),
+                  )
+                : finalizeStreamingParts(responseMessage.parts);
+
             const serializedMessage = {
               metadata: JSON.parse(JSON.stringify(metadata)),
               parts: JSON.parse(JSON.stringify(finalizedParts)),
             };
 
-            // `isContinuation` fires when the response stream extended an
-            // existing assistant message (the leaf was an assistant with a
-            // pending tool call). In that case the row already exists — we
-            // just update its parts in place and the leaf stays where it
-            // is.
+            // Does this turn end awaiting a CLIENT-side tool result? Our
+            // parametric tools (`build_parametric_model`, `answer_user`) have
+            // no server `execute` — the browser compiles / answers and is the
+            // sole authority for their result. The server only ever sees them
+            // `input-available` (pending).
+            const hasPendingToolCall = hasPendingClientToolCall(finalizedParts);
+
+            // What to do with this row — see `decidePersistAction`:
+            //   insert → new assistant row.
+            //   update → continuation with everything resolved / pure text.
+            //   skip   → continuation still ending in a pending CLIENT tool.
+            //            The browser persists the `output-available` version
+            //            itself (`onToolOutput`); a server write here — delayed
+            //            behind `result.totalUsage` + `billing.consume` — would
+            //            land last and clobber it back to `input-available`,
+            //            leaving a dangling tool call that 500s the next send.
+            //            Mid-loop builds dodge the race because the client's
+            //            compile takes seconds; the terminal `answer_user` is
+            //            instant, so the server reliably wins. Defer to client.
             //
-            // Otherwise we insert a NEW assistant whose parent is whatever
-            // the leaf was when the request came in. For a fresh user turn
-            // that's the user message we generated this response for; for
-            // a retry (client repointed the leaf back at the parent user
-            // message) it's the same parent, so the new assistant becomes
-            // a sibling of the one being re-rolled — which is what makes
-            // BranchNavigation light up. The `update_leaf_trigger` on
-            // `public.messages` automatically advances
-            // `current_message_leaf_id` to the new row, so we don't need a
-            // separate conversations update.
-            const { error } = isContinuation
-              ? await supabaseClient
-                  .from('messages')
-                  .update(serializedMessage)
-                  .eq('id', responseMessage.id)
-                  .eq('conversation_id', conversation.id)
-              : await supabaseClient.from('messages').insert({
-                  id: responseMessage.id,
-                  conversation_id: conversation.id,
-                  role: responseMessage.role,
-                  ...serializedMessage,
-                  parent_message_id: leafMessageId,
-                });
+            // Insert places a NEW assistant under whatever the leaf was: for a
+            // fresh user turn that's the user message; for a retry (client
+            // repointed the leaf back at the parent user message) it's the same
+            // parent, so the new assistant becomes a sibling — which is what
+            // makes BranchNavigation light up. The `update_leaf_trigger` on
+            // `public.messages` auto-advances `current_message_leaf_id`, so we
+            // don't touch the conversation row here.
+            const persistAction = decidePersistAction({
+              isContinuation,
+              hasPendingToolCall,
+            });
+            let error: { message: string } | null = null;
+            if (persistAction === 'update') {
+              ({ error } = await supabaseClient
+                .from('messages')
+                .update(serializedMessage)
+                .eq('id', responseMessage.id)
+                .eq('conversation_id', conversation.id));
+            } else if (persistAction === 'insert') {
+              ({ error } = await supabaseClient.from('messages').insert({
+                id: responseMessage.id,
+                conversation_id: conversation.id,
+                role: responseMessage.role,
+                ...serializedMessage,
+                parent_message_id: leafMessageId,
+              }));
+            } else {
+              // persistAction === 'skip': the client owns this row's `parts`
+              // (it persists the resolved tool output). Still record this
+              // turn's billing metadata via a metadata-ONLY update — it touches
+              // a different column than the client's `parts` write, and
+              // Postgres re-evaluates concurrent same-row updates, so the
+              // client's parts are never clobbered.
+              ({ error } = await supabaseClient
+                .from('messages')
+                .update({ metadata: serializedMessage.metadata })
+                .eq('id', responseMessage.id)
+                .eq('conversation_id', conversation.id));
+            }
 
             if (error) {
               logError(error, {
@@ -1215,11 +1458,6 @@ export async function handleAiChatRequest(req: Request) {
             // continuation `onFinish` will fire suggestions for the real
             // final state. Avoids a wasted Haiku call AND prevents
             // mid-turn placeholder pills.
-            const hasPendingToolCall = finalizedParts.some(
-              (part) =>
-                part.type.startsWith('tool-') &&
-                (part as { state?: string }).state === 'input-available',
-            );
             if (!hasPendingToolCall && env('ANTHROPIC_API_KEY')) {
               // MUST be awaited (not `void`). `createUIMessageStream`
               // closes the SSE controller as soon as the merged stream

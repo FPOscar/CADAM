@@ -8,8 +8,14 @@ import { useToast } from '@/hooks/use-toast';
 import { previewScadColoredViaToolWorker } from '@/worker/toolWorker';
 import { apiUrl } from '@/services/api';
 import { messageRowToChatMessage, type ChatMessage } from '@/lib/aiMessages';
+import { collectStuckToolRecovery } from '@/components/chat/stuckToolRecovery';
+import { AssistantRowMissingError } from '@/services/messageService';
 import { supabase } from '@/lib/supabase';
-import { generateColoredPreview, generatePreview } from '@/utils/meshUtils';
+import {
+  generateColoredPreview,
+  generateInspectionPreview,
+  generatePreview,
+} from '@/utils/meshUtils';
 import type {
   AppUIMessage,
   ConversationSuggestionsUpdate,
@@ -70,6 +76,53 @@ interface ChatSessionProps {
    *  parent show the bouncing loader in the preview pane while the model
    *  is still producing the next artifact. */
   onLoadingChange?: (isLoading: boolean) => void;
+}
+
+type ToolMessagePart = Extract<
+  AppUIMessage['parts'][number],
+  { state: string }
+>;
+
+function isToolMessagePart(
+  part: AppUIMessage['parts'][number],
+): part is ToolMessagePart {
+  return part.type.startsWith('tool-') && 'state' in part;
+}
+
+function lastAssistantMessageIsCompleteWithParametricBuild({
+  messages,
+}: {
+  messages: AppUIMessage[];
+}) {
+  const message = messages[messages.length - 1];
+  if (!message || message.role !== 'assistant') return false;
+  if (message.parts.some((part) => part.type === 'tool-answer_user')) {
+    return false;
+  }
+
+  const lastStepStartIndex = message.parts.reduce(
+    (lastIndex, part, index) =>
+      part.type === 'step-start' ? index : lastIndex,
+    -1,
+  );
+  const toolParts = message.parts
+    .slice(lastStepStartIndex + 1)
+    .filter(isToolMessagePart);
+
+  return (
+    toolParts.some((part) => part.type === 'tool-build_parametric_model') &&
+    !toolParts.some((part) => part.type === 'tool-answer_user') &&
+    toolParts.every(
+      (part) =>
+        part.state === 'output-available' || part.state === 'output-error',
+    )
+  );
+}
+
+function answerUserInput(input: unknown): { message: string } | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const message = (input as { message?: unknown }).message;
+  return typeof message === 'string' && message.trim() ? { message } : null;
 }
 
 /**
@@ -175,12 +228,19 @@ export function ChatSession({
   // input completes. We compile the OpenSCAD locally, upload the preview,
   // persist the assistant's parts to DB (so the server reads the right
   // thing on auto-continuation), and only then call `chat.addToolOutput`
-  // which triggers `sendAutomaticallyWhen` → next stream.
+  // which lets `sendAutomaticallyWhen` continue the CAD build/review loop.
   // ───────────────────────────────────────────────────────────────────────
   const chatRef = useRef<ReturnType<typeof useCachedAiChat> | null>(null);
   // Latest `chat.messages` snapshot for use inside `onToolCall` (callbacks
   // baked at Chat-init time would otherwise close over the initial array).
   const messagesRef = useRef<AppUIMessage[]>(initialBranch);
+  // Set when persisting a tool's `output-available` to the DB fails. The
+  // server reads the branch from the DB (never from client-sent messages), so
+  // auto-resubmitting after a failed persist would continue against a stale
+  // branch — at best a wasted round-trip the server has to recover from. While
+  // this is set, `sendAutomaticallyWhen` returns false so the loop pauses and
+  // the user can retry. Reset at the top of each `handleToolCall`.
+  const persistFailedRef = useRef(false);
 
   const handleToolCall = useCallback(
     async ({
@@ -192,9 +252,17 @@ export function ChatSession({
         input: unknown;
       };
     }) => {
-      if (toolCall.toolName !== 'build_parametric_model') return;
+      if (
+        toolCall.toolName !== 'build_parametric_model' &&
+        toolCall.toolName !== 'answer_user'
+      ) {
+        return;
+      }
       const chat = chatRef.current;
       if (!chat) return;
+
+      // Fresh tool call → clear any prior persist-failure pause.
+      persistFailedRef.current = false;
 
       // Prefer the SDK's live `chat.messages` — it's always current.
       // `messagesRef.current` is a React-mirrored copy that lags one
@@ -205,13 +273,101 @@ export function ChatSession({
             msg.role === 'assistant' &&
             msg.parts.some(
               (p) =>
-                p.type === 'tool-build_parametric_model' &&
+                p.type === `tool-${toolCall.toolName}` &&
+                'toolCallId' in p &&
                 p.toolCallId === toolCall.toolCallId,
             ),
         );
       const assistant =
         findAssistant(chat.messages as AppUIMessage[]) ??
         findAssistant(messagesRef.current);
+
+      if (toolCall.toolName === 'answer_user') {
+        const output = answerUserInput(toolCall.input);
+        if (!output) {
+          const errorText = 'answer_user input was missing a message.';
+          // Persist the error so the DB row isn't left with a dangling
+          // `input-available` tool call (which would 500 the next send before
+          // the server-side sanitizer rewrites it).
+          if (assistant) {
+            const nextParts = assistant.parts.map((existing) =>
+              existing.type === 'tool-answer_user' &&
+              existing.toolCallId === toolCall.toolCallId
+                ? ({
+                    type: 'tool-answer_user',
+                    toolCallId: toolCall.toolCallId,
+                    state: 'output-error',
+                    input: toolCall.input,
+                    errorText,
+                  } as AppUIMessage['parts'][number])
+                : existing,
+            ) as AppUIMessage['parts'];
+            try {
+              await onToolOutput(assistant.id, nextParts);
+            } catch (persistError) {
+              console.warn(
+                'Failed to persist answer_user error to DB:',
+                persistError,
+              );
+            }
+          }
+          chat.addToolOutput({
+            state: 'output-error',
+            tool: 'answer_user',
+            toolCallId: toolCall.toolCallId,
+            errorText,
+          });
+          return;
+        }
+
+        const successPart = {
+          type: 'tool-answer_user',
+          toolCallId: toolCall.toolCallId,
+          state: 'output-available',
+          input: output,
+          output,
+        } as AppUIMessage['parts'][number];
+
+        if (assistant) {
+          const nextParts = assistant.parts.map((existing) => {
+            if (
+              existing.type === 'tool-answer_user' &&
+              existing.toolCallId === toolCall.toolCallId
+            ) {
+              return successPart;
+            }
+            if (
+              (existing.type === 'reasoning' || existing.type === 'text') &&
+              existing.state === 'streaming'
+            ) {
+              return { ...existing, state: 'done' as const };
+            }
+            return existing;
+          }) as AppUIMessage['parts'];
+
+          try {
+            await onToolOutput(assistant.id, nextParts);
+          } catch (persistError) {
+            console.warn(
+              'Failed to persist answer_user output to DB:',
+              persistError,
+            );
+            toast({
+              title: "Couldn't save the reply",
+              description:
+                'Your message is shown but may not survive a refresh. Please retry if it disappears.',
+              variant: 'destructive',
+            });
+          }
+        }
+
+        chat.addToolOutput({
+          tool: 'answer_user',
+          toolCallId: toolCall.toolCallId,
+          output,
+        });
+        return;
+      }
 
       // Build the next parts array for `assistant`, replacing the
       // matching tool part with `replacement` and normalising any
@@ -254,28 +410,37 @@ export function ChatSession({
       // stuck `input-available` state, which would break every
       // subsequent send because the server can't continue a
       // conversation with an unresolved tool call).
+      //
+      // Persist BEFORE `addToolOutput` — same ordering as the success path.
+      // `addToolOutput` is what triggers `sendAutomaticallyWhen`, and the
+      // server continues from the DB branch, so the resolved (error) parts
+      // must be on disk before the resubmit can fire. A compile error SHOULD
+      // auto-continue (the model fixes it), so we don't pause here on a failed
+      // persist; the server-side sanitizer backstops a stale read.
       const finishWithError = async (errorText: string) => {
+        if (assistant) {
+          const errorPart = {
+            type: 'tool-build_parametric_model',
+            toolCallId: toolCall.toolCallId,
+            state: 'output-error',
+            input: toolCall.input,
+            errorText,
+          } as AppUIMessage['parts'][number];
+          const nextParts = buildNextParts(errorPart);
+          if (nextParts) {
+            try {
+              await onToolOutput(assistant.id, nextParts);
+            } catch (persistError) {
+              console.warn('Failed to persist tool error to DB:', persistError);
+            }
+          }
+        }
         chat.addToolOutput({
           state: 'output-error',
           tool: 'build_parametric_model',
           toolCallId: toolCall.toolCallId,
           errorText,
         });
-        if (!assistant) return;
-        const errorPart = {
-          type: 'tool-build_parametric_model',
-          toolCallId: toolCall.toolCallId,
-          state: 'output-error',
-          input: toolCall.input,
-          errorText,
-        } as AppUIMessage['parts'][number];
-        const nextParts = buildNextParts(errorPart);
-        if (!nextParts) return;
-        try {
-          await onToolOutput(assistant.id, nextParts);
-        } catch (persistError) {
-          console.warn('Failed to persist tool error to DB:', persistError);
-        }
       };
 
       const input = isParametricArtifact(toolCall.input)
@@ -290,45 +455,74 @@ export function ChatSession({
       }
 
       try {
-        // Render + upload the preview as part of the tool's execution,
-        // BEFORE `addToolOutput` triggers the auto-continuation. The
-        // server reads it back by toolCallId (see `previewPathForToolCall`
-        // in `aiChat.ts`) and the MessageBubble's `<ParametricImagePreview>`
-        // pulls from the same canonical path via `usePreview`. No path is
-        // returned in the tool output — both consumers derive it.
-        // Mirror VisualCard / ParametricImagePreview's get-or-generate path:
-        // prefer the colored OFF render so the cached thumbnail matches what
-        // the rest of the app shows. Fall back to the gray STL render if OFF
-        // is unavailable or empty.
+        // Upload both images before auto-continuation:
+        // - preview-* is the single ISO thumbnail the chat UI displays.
+        // - inspection-preview-* is the multi-view sheet the agent receives.
         const { stl, off } = await previewScadColoredViaToolWorker(input.code);
+        let inspectionUploaded = false;
         try {
           if (user?.id) {
-            let previewDataUrl: string | null = null;
-            if (off) {
-              previewDataUrl = await generateColoredPreview(off);
-            }
-            if (!previewDataUrl) {
-              previewDataUrl = await generatePreview(stl, 'stl');
-            }
-            const previewBlob = await fetch(previewDataUrl).then((response) =>
-              response.blob(),
+            const inspectionDataUrl = await generateInspectionPreview({
+              stl,
+              off,
+            });
+            const inspectionBlob = await fetch(inspectionDataUrl).then(
+              (response) => response.blob(),
             );
-            const previewPath = `${user.id}/${conversation.id}/preview-${toolCall.toolCallId}`;
-            await supabase.storage
+            const inspectionPath = `${user.id}/${conversation.id}/inspection-preview-${toolCall.toolCallId}`;
+            const { error: inspectionUploadError } = await supabase.storage
               .from('images')
-              .upload(previewPath, previewBlob, {
+              .upload(inspectionPath, inspectionBlob, {
                 contentType: 'image/png',
                 upsert: true,
               });
+            if (inspectionUploadError) throw inspectionUploadError;
+            inspectionUploaded = true;
           }
         } catch (uploadError) {
-          console.warn('Failed to upload OpenSCAD preview:', uploadError);
+          console.warn(
+            'Failed to upload OpenSCAD inspection preview:',
+            uploadError,
+          );
         }
 
+        try {
+          if (user?.id) {
+            let thumbnailDataUrl: string | null = null;
+            if (off) {
+              thumbnailDataUrl = await generateColoredPreview(off);
+            }
+            if (!thumbnailDataUrl) {
+              thumbnailDataUrl = await generatePreview(stl, 'stl');
+            }
+            const thumbnailBlob = await fetch(thumbnailDataUrl).then(
+              (response) => response.blob(),
+            );
+            const previewPath = `${user.id}/${conversation.id}/preview-${toolCall.toolCallId}`;
+            const { error: thumbnailUploadError } = await supabase.storage
+              .from('images')
+              .upload(previewPath, thumbnailBlob, {
+                contentType: 'image/png',
+                upsert: true,
+              });
+            if (thumbnailUploadError) throw thumbnailUploadError;
+          }
+        } catch (uploadError) {
+          console.warn('Failed to upload OpenSCAD thumbnail:', uploadError);
+        }
+
+        const inspectionViews: Array<
+          'ISO' | 'FRONT' | 'BACK' | 'LEFT' | 'RIGHT' | 'TOP' | 'BOTTOM'
+        > = ['ISO', 'FRONT', 'BACK', 'LEFT', 'RIGHT', 'TOP', 'BOTTOM'];
         const output = {
           status: 'success' as const,
-          message:
-            'Compilation successful. The 3D model is now displayed to the user.',
+          inspection: {
+            views: inspectionViews,
+            imageAttached: inspectionUploaded,
+          },
+          message: inspectionUploaded
+            ? 'Compilation successful. Inspect the multi-view render in this tool result against the user request from every visible angle. If any required feature is missing, wrong, too simple, disconnected, non-printable, hidden from some view, or visually unclear, call build_parametric_model again with a corrected complete OpenSCAD script. If all views satisfy the request, give a concise final response.'
+            : 'Compilation successful, but the multi-view preview sheet was not available. Review the OpenSCAD you wrote against the user request. If anything is missing, wrong, too simple, disconnected, non-printable, or visually unclear, call build_parametric_model again with a corrected complete OpenSCAD script. If it satisfies the request, give a concise final response.',
         };
 
         const successPart = {
@@ -340,11 +534,26 @@ export function ChatSession({
         } as AppUIMessage['parts'][number];
         const nextParts = buildNextParts(successPart);
 
+        if (assistant) {
+          onViewArtifact(input, assistant.id);
+        }
+
         if (nextParts && assistant) {
           try {
             await onToolOutput(assistant.id, nextParts);
           } catch (persistError) {
             console.warn('Failed to persist tool output to DB:', persistError);
+            // The server continues from the DB branch. If this build's output
+            // never landed, auto-resubmitting would run against a stale branch
+            // and discard a model the user can already see. Pause the loop and
+            // let them retry.
+            persistFailedRef.current = true;
+            toast({
+              title: "Couldn't save this step",
+              description:
+                "The model is shown but the build wasn't saved, so Adam paused. Please retry.",
+              variant: 'destructive',
+            });
           }
         }
 
@@ -359,7 +568,7 @@ export function ChatSession({
         );
       }
     },
-    [conversation.id, onToolOutput, user?.id],
+    [conversation.id, onToolOutput, onViewArtifact, toast, user?.id],
   );
 
   // ───────────────────────────────────────────────────────────────────────
@@ -372,7 +581,14 @@ export function ChatSession({
     messages: initialBranch,
     transport,
     onToolCall: handleToolCall,
-    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
+    // Pause the loop if a tool-output persist failed — resubmitting would run
+    // the server against a stale DB branch (see `persistFailedRef`).
+    sendAutomaticallyWhen: (ctx) => {
+      if (persistFailedRef.current) return false;
+      return conversation.type === 'parametric'
+        ? lastAssistantMessageIsCompleteWithParametricBuild(ctx)
+        : lastAssistantMessageIsCompleteWithToolCalls(ctx);
+    },
     // Out-of-band conversation-level signals (title + suggestions) arrive
     // here as transient data parts — they never land in `messages.parts`,
     // so we patch the conversation query cache directly. See
@@ -474,34 +690,19 @@ export function ChatSession({
     if (recoveredChatRef.current === chat) return;
     recoveredChatRef.current = chat;
 
-    const stuckByMessageId = new Map<string, AppUIMessage['parts']>();
-    for (const msg of chat.messages as AppUIMessage[]) {
-      if (msg.role !== 'assistant') continue;
-      let dirty = false;
-      const nextParts = msg.parts.map((p) => {
-        if (
-          p.type === 'tool-build_parametric_model' &&
-          (p.state === 'input-streaming' || p.state === 'input-available')
-        ) {
-          dirty = true;
-          return {
-            ...p,
-            state: 'output-error' as const,
-            errorText:
-              'Tool execution did not complete in the previous session.',
-          };
-        }
-        if (
-          (p.type === 'reasoning' || p.type === 'text') &&
-          p.state === 'streaming'
-        ) {
-          dirty = true;
-          return { ...p, state: 'done' as const };
-        }
-        return p;
-      }) as AppUIMessage['parts'];
-      if (dirty) stuckByMessageId.set(msg.id, nextParts);
-    }
+    // `chat.status` is read once per chat+mount on purpose: a cached Chat
+    // that is mid-generation when ChatSession (re)mounts is not "stuck from
+    // a previous session", and collectStuckToolRecovery skips it entirely.
+    //
+    // The scan is structurally typed (dependency-free for its unit tests),
+    // so its map comes back as `RecoveryPartLike[]` values. Every rewrite
+    // spreads the original part and only narrows tool/text `state`, so
+    // re-narrowing to our part union is sound — this is the one place the
+    // structural boundary is crossed.
+    const stuckByMessageId = collectStuckToolRecovery({
+      status: chat.status,
+      messages: chat.messages,
+    }) as Map<string, AppUIMessage['parts']>;
 
     if (stuckByMessageId.size === 0) return;
 
@@ -515,6 +716,17 @@ export function ChatSession({
 
     for (const [messageId, nextParts] of stuckByMessageId) {
       void onToolOutput(messageId, nextParts).catch((err) => {
+        if (err instanceof AssistantRowMissingError) {
+          // The interruption happened before the server's `onFinish` INSERT,
+          // so this assistant exists only in the cached in-memory chat. The
+          // DB branch (leaf = the user message) has no dangling tool call to
+          // repair, and the setMessages above already fixed the UI.
+          console.info(
+            'Stuck-tool recovery: assistant row was never persisted; ' +
+              'nothing to repair in DB (benign).',
+          );
+          return;
+        }
         console.warn('Failed to persist stuck-tool recovery:', err);
       });
     }
@@ -695,11 +907,11 @@ export function ChatSession({
   return (
     <>
       <ScrollArea
-        className="relative w-full max-w-none flex-1 self-center px-3 py-0 md:min-h-0 md:p-4"
+        className="relative w-full min-w-0 max-w-full flex-1 self-center overflow-x-hidden px-3 py-0 md:min-h-0 md:p-4 [&_[data-radix-scroll-area-viewport]]:overflow-x-hidden"
         ref={scrollRef}
       >
         <div className="pointer-events-none sticky left-0 top-0 z-50 h-3 bg-gradient-to-b from-adam-bg-secondary-dark/90 to-transparent md:hidden" />
-        <div className="mx-auto flex max-w-3xl flex-col gap-4 pb-6 md:gap-8 md:pb-0">
+        <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-4 pb-6 md:gap-8 md:pb-4">
           {branchNodes.map((node, index) => {
             const isLastMessage = index === branchNodes.length - 1;
             return (

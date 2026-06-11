@@ -41,6 +41,17 @@ export async function persistUserMessage({
 }
 
 /**
+ * Thrown when `persistAssistantParts` matched no row even after retries —
+ * the assistant row was never INSERTed (the stream was interrupted before
+ * the server's `onFinish` ran). Callers that merely mirror in-memory state
+ * onto an existing row (load-time stuck-tool recovery) can treat this as
+ * benign: with no row, the DB branch has no dangling tool call to repair.
+ * Callers persisting NEW tool output must still surface it — the server
+ * continues from the DB branch, so a lost write means a stale continuation.
+ */
+export class AssistantRowMissingError extends Error {}
+
+/**
  * Persist updated `parts` on an existing assistant row. Used after the
  * client compiles a `build_parametric_model` tool call locally — we need
  * the DB row to reflect the completed tool output before the server reads
@@ -61,17 +72,40 @@ export async function persistAssistantParts({
   // output), leaving the existing metadata untouched.
   metadata?: AppUIMessage['metadata'];
 }) {
-  const { error } = await supabase
-    .from('messages')
-    .update({
-      parts: JSON.parse(JSON.stringify(parts)),
-      ...(metadata !== undefined
-        ? { metadata: JSON.parse(JSON.stringify(metadata)) }
-        : {}),
-    })
-    .eq('id', messageId)
-    .eq('conversation_id', conversationId);
-  if (error) throw error;
+  const payload = {
+    parts: JSON.parse(JSON.stringify(parts)),
+    ...(metadata !== undefined
+      ? { metadata: JSON.parse(JSON.stringify(metadata)) }
+      : {}),
+  };
+
+  // A matched-nothing update is silent in PostgREST. The usual cause is benign
+  // and self-healing: the client resolved a tool call before the server's
+  // `onFinish` INSERT for this assistant row landed. The server walks the
+  // branch from the DB on continuation, so we must NOT report success on a
+  // no-op (the tool output would be lost and the server would continue from a
+  // stale/absent branch). Retry briefly to let the INSERT land, then throw so
+  // the caller can pause/surface it. ~1.7s total covers the insert latency
+  // (stream close + `result.totalUsage` + `billing.consume`) without hanging.
+  const MAX_ATTEMPTS = 6;
+  const RETRY_DELAY_MS = 350;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const { data, error } = await supabase
+      .from('messages')
+      .update(payload)
+      .eq('id', messageId)
+      .eq('conversation_id', conversationId)
+      .select('id');
+    if (error) throw error;
+    if (data && data.length > 0) return;
+    if (attempt < MAX_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+  }
+  throw new AssistantRowMissingError(
+    `persistAssistantParts matched no row after ${MAX_ATTEMPTS} attempts ` +
+      `(messageId=${messageId}). The assistant message was never persisted.`,
+  );
 }
 
 export const useMessagesQuery = () => {
