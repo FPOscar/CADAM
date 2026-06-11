@@ -1,5 +1,6 @@
 export function env(name: string): string {
-  return process.env[name] ?? '';
+  const value = process.env[name] ?? '';
+  return /^<[^>]+>$/.test(value.trim()) ? '' : value;
 }
 
 export function requiredEnv(name: string): string {

@@ -270,6 +270,7 @@ const THINKING_BUDGET_TOKENS = 9000;
 type ChatProvider = 'anthropic' | 'google' | 'openrouter';
 
 function providerFor(modelId: string): ChatProvider {
+  if (env('OPENROUTER_API_KEY')) return 'openrouter';
   if (modelId.startsWith('anthropic/')) return 'anthropic';
   if (modelId.startsWith('google/')) return 'google';
   return 'openrouter';
@@ -314,16 +315,20 @@ function createChatProviders(): ChatProviders {
  * Map a `<provider>/<model>` ID to a configured LanguageModel + the
  * provider-specific options the AI SDK expects at the streamText boundary.
  *
- * Anthropic and Google are hit directly via their respective AI SDK providers.
- * Everything else (OpenAI, MoonshotAI, …) keeps going through OpenRouter so we
- * don't have to wire a dedicated provider per vendor.
+ * Prefer OpenRouter for chat when it is configured. The model picker uses
+ * OpenRouter-style IDs (`provider/model`), and a single OpenRouter key should
+ * cover those providers in local/dev setups. If OpenRouter is not configured,
+ * direct Anthropic/Google clients remain available for deployments that provide
+ * those provider-specific keys.
  */
 function buildChatModel(
   modelId: string,
   providers: ChatProviders,
   thinking: boolean,
 ): { model: LanguageModel; providerOptions?: ProviderOptions } {
-  if (modelId.startsWith('anthropic/')) {
+  const provider = providerFor(modelId);
+
+  if (provider === 'anthropic') {
     // Anthropic's API uses dashes everywhere ("claude-haiku-4-5"), while the
     // OpenRouter alias uses dots ("claude-haiku-4.5"). Normalize both.
     const id = modelId.slice('anthropic/'.length).replace(/\./g, '-');
@@ -342,7 +347,7 @@ function buildChatModel(
     };
   }
 
-  if (modelId.startsWith('google/')) {
+  if (provider === 'google') {
     const id = modelId.slice('google/'.length);
     return {
       model: providers.google()(id),

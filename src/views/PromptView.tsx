@@ -41,10 +41,24 @@ const EXTENSION_PILLS = [
   },
 ] as const;
 
+function getErrorMessage(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (
+    error &&
+    typeof error === 'object' &&
+    'message' in error &&
+    typeof error.message === 'string'
+  ) {
+    return error.message;
+  }
+  return 'Failed to process prompt';
+}
+
 export function PromptView() {
   const navigate = useNavigate();
   const { toast } = useToast();
   const { user, billing, isLoading } = useAuth();
+  const isBillingPending = !!user && !billing;
   const totalTokens = billing?.tokens.total ?? 0;
   const { data: profile, isLoading: isProfileLoading } = useProfile();
   const { isSidebarOpen } = useLayoutContext();
@@ -83,14 +97,14 @@ export function PromptView() {
   );
 
   const lowPrompts = useMemo(() => {
-    if (isLoading) return false;
+    if (isLoading || !billing) return false;
     return totalTokens > 0 && totalTokens <= 10;
-  }, [totalTokens, isLoading]);
+  }, [billing, totalTokens, isLoading]);
 
   const limitReached = useMemo(() => {
-    if (isLoading) return false;
+    if (isLoading || !billing) return false;
     return totalTokens <= 0;
-  }, [totalTokens, isLoading]);
+  }, [billing, totalTokens, isLoading]);
 
   // Trigger fade in on mount
   useEffect(() => {
@@ -225,8 +239,7 @@ export function PromptView() {
       Sentry.captureException(error);
       toast({
         title: 'Error',
-        description:
-          error instanceof Error ? error.message : 'Failed to process prompt',
+        description: getErrorMessage(error),
         variant: 'destructive',
       });
     },
@@ -299,7 +312,7 @@ export function PromptView() {
                   }}
                   placeholder="Start building with Adam..."
                   type={type}
-                  disabled={limitReached || isGenerating}
+                  disabled={isBillingPending || limitReached || isGenerating}
                   model={model}
                   setModel={setModel}
                   showPromptGenerator={true}
@@ -308,51 +321,59 @@ export function PromptView() {
                 />
               </SelectedItemsContext.Provider>
               <div className="relative">
-                {isLoading && (
+                {(isLoading || isBillingPending) && (
                   <div className="absolute left-0 right-0 top-0">
                     <div className="h-5 w-5 animate-spin rounded-full border-2 border-adam-blue border-t-transparent" />
                   </div>
                 )}
-                {!isLoading && user && limitReached && (
+                {!isLoading && !isBillingPending && user && limitReached && (
                   <div className="absolute left-0 right-0 top-0">
                     <LimitReachedMessage />
                   </div>
                 )}
-                {!isLoading && user && lowPrompts && !limitReached && (
-                  <div className="absolute left-0 right-0 top-0">
-                    <LowPromptsWarningMessage tokensRemaining={totalTokens} />
+                {!isLoading &&
+                  !isBillingPending &&
+                  user &&
+                  lowPrompts &&
+                  !limitReached && (
+                    <div className="absolute left-0 right-0 top-0">
+                      <LowPromptsWarningMessage tokensRemaining={totalTokens} />
+                    </div>
+                  )}
+              </div>
+              {!isLoading &&
+                !isBillingPending &&
+                user &&
+                !limitReached &&
+                !lowPrompts && (
+                  <div className="flex flex-wrap justify-center gap-2">
+                    {EXTENSION_PILLS.map(({ href, event, label }) => (
+                      <a
+                        key={event}
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => {
+                          try {
+                            posthog.capture(event, { location: 'prompt_view' });
+                          } catch {
+                            // Analytics failures (e.g. blocked by ad-blocker)
+                            // must never block the link's navigation.
+                          }
+                        }}
+                        className="group inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-1.5 text-sm text-adam-text-secondary transition-colors hover:border-adam-blue/40 hover:bg-adam-blue/10 hover:text-adam-text-primary"
+                      >
+                        <span>
+                          Try our{' '}
+                          <span className="font-medium text-adam-blue">
+                            {label}
+                          </span>
+                        </span>
+                        <ArrowUpRight className="h-3.5 w-3.5 transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5" />
+                      </a>
+                    ))}
                   </div>
                 )}
-              </div>
-              {!isLoading && user && !limitReached && !lowPrompts && (
-                <div className="flex flex-wrap justify-center gap-2">
-                  {EXTENSION_PILLS.map(({ href, event, label }) => (
-                    <a
-                      key={event}
-                      href={href}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      onClick={() => {
-                        try {
-                          posthog.capture(event, { location: 'prompt_view' });
-                        } catch {
-                          // Analytics failures (e.g. blocked by ad-blocker)
-                          // must never block the link's navigation.
-                        }
-                      }}
-                      className="group inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-1.5 text-sm text-adam-text-secondary transition-colors hover:border-adam-blue/40 hover:bg-adam-blue/10 hover:text-adam-text-primary"
-                    >
-                      <span>
-                        Try our{' '}
-                        <span className="font-medium text-adam-blue">
-                          {label}
-                        </span>
-                      </span>
-                      <ArrowUpRight className="h-3.5 w-3.5 transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5" />
-                    </a>
-                  ))}
-                </div>
-              )}
               {!user && (
                 <p className="text-center text-sm text-gray-500">
                   <Link

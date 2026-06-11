@@ -270,8 +270,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         session,
         user,
         billing: billing ?? null,
-        isLoading:
-          isLoading || (!!user && (isBillingLoading || isProfileLoading)),
+        isLoading,
         signIn,
         signUp,
         signInWithMagicLink,
